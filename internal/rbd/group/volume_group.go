@@ -30,6 +30,8 @@ import (
 	"github.com/ceph/ceph-csi/internal/rbd/types"
 	"github.com/ceph/ceph-csi/internal/util"
 	"github.com/ceph/ceph-csi/internal/util/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -184,7 +186,7 @@ func (vg *volumeGroup) Create(ctx context.Context) error {
 	return nil
 }
 
-func (vg *volumeGroup) Delete(ctx context.Context) error {
+func (vg *volumeGroup) Delete(ctx context.Context, vgMirrorInfo types.MirrorInfo) error {
 	name, err := vg.GetName(ctx)
 	if err != nil {
 		return err
@@ -193,6 +195,39 @@ func (vg *volumeGroup) Delete(ctx context.Context) error {
 	ioctx, err := vg.GetIOContext(ctx)
 	if err != nil {
 		return err
+	}
+
+	// Cleanup only omap data if the following condition is met
+	// Mirroring is enabled on the group
+	// Local group is secondary
+	// Local group is in up+replaying state
+	if vgrMirrorInfo.GetState() == librbd.MirrorGroupEnabled.String() && !vgrMirrorInfo.IsPrimary() {
+		// If the group is in a secondary state and its up+replaying means its
+		// an healthy secondary and the group is primary somewhere in the
+		// remote cluster and the local group is getting replayed. Delete the
+		// OMAP data generated as we cannot delete the secondary group. When
+		// the group on the primary cluster gets deleted/mirroring disabled,
+		// the group on all the remote (secondary) clusters will get
+		// auto-deleted. This helps in garbage collecting the OMAP, VR, VGR,
+		// VGRC, PVC and PV objects after failback operation.
+		sts, rErr := vg.GetGlobalMirroringStatus(ctx)
+		if rErr != nil {
+			return status.Error(codes.Internal, rErr.Error())
+		}
+
+		localStatus, rErr := sts.GetLocalSiteStatus()
+		if rErr != nil {
+			log.ErrorLog(ctx, "failed to get local status for volume group%s: %w", name, rErr)
+
+			return status.Error(codes.Internal, rErr.Error())
+		}
+		if localStatus.IsUP() && localStatus.GetState() == librbd.MirrorGroupStatusStateReplaying.String() {
+			return vg.commonVolumeGroup.Delete(ctx)
+		}
+		log.ErrorLog(ctx,
+			"secondary group status is up=%t and state=%s",
+			localStatus.IsUP(),
+			localStatus.GetState())
 	}
 
 	err = librbd.GroupRemove(ioctx, name)
@@ -414,4 +449,8 @@ func (vg *volumeGroup) CreateSnapshots(
 	}
 
 	return snapshots, nil
+}
+
+func (vg *volumeGroup) ToMirror() (types.Mirror, error) {
+	return volumeGroupMirror{vg}, nil
 }

@@ -210,27 +210,35 @@ func (vs *VolumeGroupServer) DeleteVolumeGroup(
 
 	log.DebugLog(ctx, "VolumeGroup %q has been found", req.GetVolumeGroupId())
 
-	// verify that the volume group is empty
-	volumes, err := vg.ListVolumes(ctx)
+	vgrMirrorInfo, err := vg.GetMirroringInfo(ctx)
 	if err != nil {
-		return nil, status.Errorf(
-			codes.NotFound,
-			"could not list volumes for voluem group %q: %s",
-			req.GetVolumeGroupId(),
-			err.Error())
+		log.ErrorLog(ctx, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	log.DebugLog(ctx, "VolumeGroup %q contains %d volumes", req.GetVolumeGroupId(), len(volumes))
+	// verify that the volume group is empty, if the group is primary
+	if vgrMirrorInfo.IsPrimary() {
+		volumes, err := vg.ListVolumes(ctx)
+		if err != nil {
+			return nil, status.Errorf(
+				codes.NotFound,
+				"could not list volumes for volume group %q: %s",
+				req.GetVolumeGroupId(),
+				err.Error())
+		}
 
-	if len(volumes) != 0 {
-		return nil, status.Errorf(
-			codes.FailedPrecondition,
-			"rejecting to delete non-empty volume group %q",
-			req.GetVolumeGroupId())
+		log.DebugLog(ctx, "VolumeGroup %q contains %d volumes", req.GetVolumeGroupId(), len(volumes))
+
+		if len(volumes) != 0 {
+			return nil, status.Errorf(
+				codes.FailedPrecondition,
+				"rejecting to delete non-empty volume group %q",
+				req.GetVolumeGroupId())
+		}
 	}
 
 	// delete the volume group
-	err = vg.Delete(ctx)
+	err = vg.Delete(ctx, vgrMirrorInfo)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to delete volume group %q: %s",

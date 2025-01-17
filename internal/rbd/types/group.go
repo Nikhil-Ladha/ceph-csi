@@ -58,7 +58,7 @@ type VolumeGroup interface {
 	Create(ctx context.Context) error
 
 	// Delete removes the VolumeGroup from the backend storage.
-	Delete(ctx context.Context) error
+	Delete(ctx context.Context, vgrMirrorInfo MirrorInfo) error
 
 	// AddVolume adds the Volume to the VolumeGroup.
 	AddVolume(ctx context.Context, volume Volume) error
@@ -73,4 +73,7 @@ type VolumeGroup interface {
 	// The Snapshots are crash consistent, and created as a consistency
 	// group.
 	CreateSnapshots(ctx context.Context, cr *util.Credentials, name string) ([]Snapshot, error)
+
+	// ToMirror converts the VolumeGroup to a Mirror.
+	ToMirror() (Mirror, error)
 }
