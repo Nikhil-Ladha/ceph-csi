@@ -26,6 +26,8 @@ import (
 	librbd "github.com/ceph/go-ceph/rbd"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/csi-addons/spec/lib/go/volumegroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ceph/ceph-csi/internal/rbd/types"
 	"github.com/ceph/ceph-csi/internal/util"
@@ -33,8 +35,9 @@ import (
 )
 
 var (
-	ErrRBDGroupNotConnected = fmt.Errorf("%w: RBD group is not connected", librados.ErrNotConnected)
-	ErrRBDGroupNotFound     = fmt.Errorf("%w: RBD group not found", librbd.ErrNotFound)
+	ErrRBDGroupNotConnected    = fmt.Errorf("%w: RBD group is not connected", librados.ErrNotConnected)
+	ErrRBDGroupNotFound        = fmt.Errorf("%w: RBD group not found", librbd.ErrNotFound)
+	ErrRBDGroupInvalidArgument = fmt.Errorf("RBD group invalid arguments provided")
 )
 
 // volumeGroup handles all requests for 'rbd group' operations.
@@ -184,7 +187,7 @@ func (vg *volumeGroup) Create(ctx context.Context) error {
 	return nil
 }
 
-func (vg *volumeGroup) Delete(ctx context.Context) error {
+func (vg *volumeGroup) Delete(ctx context.Context, vgrMirrorInfo types.MirrorInfo, mirror types.Mirror) error {
 	name, err := vg.GetName(ctx)
 	if err != nil {
 		return err
@@ -193,6 +196,42 @@ func (vg *volumeGroup) Delete(ctx context.Context) error {
 	ioctx, err := vg.GetIOContext(ctx)
 	if err != nil {
 		return err
+	}
+
+	// Cleanup only omap data if the following condition is met
+	// Mirroring is enabled on the group
+	// Local group is secondary
+	// Local group is in up+replaying state
+	log.DebugLog(ctx, "volume group %v is in %v state and is primary %v", vg, vgrMirrorInfo.GetState(), vgrMirrorInfo.IsPrimary())
+	if vgrMirrorInfo != nil && vgrMirrorInfo.GetState() == librbd.MirrorGroupEnabled.String() && !vgrMirrorInfo.IsPrimary() {
+		// If the group is in a secondary state and its up+replaying means its
+		// an healthy secondary and the group is primary somewhere in the
+		// remote cluster and the local group is getting replayed. Delete the
+		// OMAP data generated as we cannot delete the secondary group. When
+		// the group on the primary cluster gets deleted/mirroring disabled,
+		// the group on all the remote (secondary) clusters will get
+		// auto-deleted. This helps in garbage collecting the OMAP, VR, VGR,
+		// VGRC, PVC and PV objects after failback operation.
+		if mirror != nil {
+			sts, rErr := mirror.GetGlobalMirroringStatus(ctx)
+			if rErr != nil {
+				return status.Error(codes.Internal, rErr.Error())
+			}
+			localStatus, rErr := sts.GetLocalSiteStatus()
+			if rErr != nil {
+				log.ErrorLog(ctx, "failed to get local status for volume group%s: %w", name, rErr)
+				return status.Error(codes.Internal, rErr.Error())
+			}
+			log.DebugLog(ctx, "local status is %v and local state is %v", localStatus.IsUP(), localStatus.GetState())
+			if localStatus.IsUP() && localStatus.GetState() == librbd.MirrorGroupStatusStateReplaying.String() {
+				return vg.commonVolumeGroup.Delete(ctx)
+			}
+			log.ErrorLog(ctx,
+				"%w: secondary group status is up=%t and state=%s",
+				ErrRBDGroupInvalidArgument,
+				localStatus.IsUP(),
+				localStatus.GetState())
+		}
 	}
 
 	err = librbd.GroupRemove(ioctx, name)
@@ -258,13 +297,13 @@ func (vg *volumeGroup) RemoveVolume(ctx context.Context, vol types.Volume) error
 		return nil
 	}
 
+	log.DebugLog(ctx, "removing image %v from group %v", vol, vg)
 	err := vol.RemoveFromGroup(ctx, vg)
 	if err != nil {
-		if errors.Is(err, librbd.ErrNotExist) {
-			return nil
+		if !errors.Is(err, librbd.ErrNotExist) {
+			return fmt.Errorf("failed to remove volume %q from volume group %q: %w", vol, vg, err)
 		}
-
-		return fmt.Errorf("failed to remove volume %q from volume group %q: %w", vol, vg, err)
+		log.DebugLog(ctx, "volume %q doesn't exist", vol)
 	}
 
 	// toRemove contain the ID of the volume that is removed from the group

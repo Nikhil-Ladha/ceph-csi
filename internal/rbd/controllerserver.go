@@ -1081,6 +1081,25 @@ func cleanupRBDImage(ctx context.Context,
 		return nil, status.Errorf(codes.Aborted, "rbd %s is still being used", rbdVol.RbdImageName)
 	}
 
+	// check if the image is part of a group, if yes then error out
+	image, err := rbdVol.open()
+	if err != nil {
+		err = fmt.Errorf("failed to open image %q: %w", rbdVol, err)
+		return &csi.DeleteVolumeResponse{}, err
+	}
+	defer image.Close()
+
+	imageInfo, err := image.GetGroup()
+	if err != nil {
+		err = fmt.Errorf("could not get group information for image %q: %w", rbdVol, err)
+		return &csi.DeleteVolumeResponse{}, err
+	}
+
+	if imageInfo.Name != "" {
+		err = fmt.Errorf("image %q is a part of volume group %q", rbdVol, imageInfo.Name)
+		return &csi.DeleteVolumeResponse{}, err
+	}
+
 	// delete the temporary rbd image created as part of volume clone during
 	// create volume
 	err = rbdVol.DeleteTempImage(ctx)

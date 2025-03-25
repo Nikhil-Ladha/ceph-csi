@@ -27,6 +27,7 @@ import (
 	"github.com/ceph/ceph-csi/internal/rbd/types"
 	"github.com/ceph/ceph-csi/internal/util/log"
 
+	"github.com/csi-addons/spec/lib/go/replication"
 	"github.com/csi-addons/spec/lib/go/volumegroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -206,27 +207,40 @@ func (vs *VolumeGroupServer) DeleteVolumeGroup(
 
 	log.DebugLog(ctx, "VolumeGroup %q has been found", req.GetVolumeGroupId())
 
-	// verify that the volume group is empty
-	volumes, err := vg.ListVolumes(ctx)
+	_, mirror, err := mgr.GetMirrorSource(ctx, req.GetVolumeGroupId(), &replication.ReplicationSource{
+		Type: &replication.ReplicationSource_Volumegroup{
+			Volumegroup: &replication.ReplicationSource_VolumeGroupSource{
+				VolumeGroupId: req.GetVolumeGroupId(),
+			},
+		},
+	})
 	if err != nil {
-		return nil, status.Errorf(
-			codes.NotFound,
-			"could not list volumes for voluem group %q: %s",
-			req.GetVolumeGroupId(),
-			err.Error())
+		return nil, getGRPCError(err)
 	}
 
-	log.DebugLog(ctx, "VolumeGroup %q contains %d volumes", req.GetVolumeGroupId(), len(volumes))
+	vgrMirrorInfo, err := mirror.GetMirroringInfo(ctx)
 
-	if len(volumes) != 0 {
-		return nil, status.Errorf(
-			codes.FailedPrecondition,
-			"rejecting to delete non-empty volume group %q",
-			req.GetVolumeGroupId())
+	// verify that the volume group is empty, if the group is primary
+	if vgrMirrorInfo.IsPrimary() {
+		volumes, err := vg.ListVolumes(ctx)
+		if err != nil {
+			return nil, status.Errorf(
+				codes.NotFound,
+				"could not list volumes for volume group %q: %s",
+				req.GetVolumeGroupId(),
+				err.Error())
+		}
+		log.DebugLog(ctx, "VolumeGroup %q contains %d volumes", req.GetVolumeGroupId(), len(volumes))
+		if len(volumes) != 0 {
+			return nil, status.Errorf(
+				codes.FailedPrecondition,
+				"rejecting to delete non-empty volume group %q",
+				req.GetVolumeGroupId())
+		}
 	}
 
 	// delete the volume group
-	err = vg.Delete(ctx)
+	err = vg.Delete(ctx, vgrMirrorInfo, mirror)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to delete volume group %q: %s",
@@ -294,6 +308,25 @@ func (vs *VolumeGroupServer) ModifyVolumeGroupMembership(
 			err.Error())
 	}
 	defer vg.Destroy(ctx)
+
+	_, mirror, err := mgr.GetMirrorSource(ctx, req.GetVolumeGroupId(), &replication.ReplicationSource{
+		Type: &replication.ReplicationSource_Volumegroup{
+			Volumegroup: &replication.ReplicationSource_VolumeGroupSource{
+				VolumeGroupId: req.GetVolumeGroupId(),
+			},
+		},
+	})
+	if err != nil {
+		return nil, getGRPCError(err)
+	}
+
+	vgrMirrorInfo, err := mirror.GetMirroringInfo(ctx)
+
+	// Skip modification of group if it's secondary
+	if !vgrMirrorInfo.IsPrimary() {
+		log.DebugLog(ctx, "skipping modification of group, as it is in secondary state")
+		return &volumegroup.ModifyVolumeGroupMembershipResponse{}, nil
+	}
 
 	beforeVolumes, err := vg.ListVolumes(ctx)
 	if err != nil {

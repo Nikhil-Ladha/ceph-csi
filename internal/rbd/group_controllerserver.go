@@ -91,7 +91,7 @@ func (cs *ControllerServer) CreateVolumeGroupSnapshot(
 			// the VG should always be deleted, volumes can only belong to a single VG
 			log.DebugLog(ctx, "removing temporary volume group %q", vg)
 
-			vgErr := vg.Delete(ctx)
+			vgErr := vg.Delete(ctx, nil, nil)
 			if vgErr != nil {
 				log.ErrorLog(ctx, "failed to remove temporary volume group %q: %v", vg, vgErr)
 			}
