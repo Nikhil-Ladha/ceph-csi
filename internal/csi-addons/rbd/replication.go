@@ -452,6 +452,25 @@ func (rs *ReplicationServer) PromoteVolume(ctx context.Context,
 			info.GetState())
 	}
 
+	globalMirroringStatus, err := mirror.GetGlobalMirroringStatus(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	localStatus, err := globalMirroringStatus.GetLocalSiteStatus()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if localStatus.IsUP() && (localStatus.GetState() != librbd.MirrorGroupStatusStateUnknown.String() &&
+		localStatus.GetState() != librbd.MirrorGroupStatusStateReplaying.String()) {
+		return nil, status.Errorf(
+			codes.Internal,
+			"group %s is not in secondary state before promotion",
+			reqID,
+			localStatus.GetState())
+	}
+
 	// promote secondary to primary
 	if !info.IsPrimary() {
 		if req.GetForce() {
@@ -544,8 +563,18 @@ func (rs *ReplicationServer) DemoteVolume(ctx context.Context,
 			info.GetState())
 	}
 
+	globalMirroringStatus, err := mirror.GetGlobalMirroringStatus(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	localStatus, err := globalMirroringStatus.GetLocalSiteStatus()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	// demote image to secondary
-	if info.IsPrimary() {
+	if info.IsPrimary() && (localStatus.IsUP() && localStatus.GetState() == librbd.MirrorGroupStatusStateStopped.String()) {
 		for _, vol := range volumes {
 			// store the image creation time for resync
 			creationTime, cErr := vol.GetCreationTime(ctx)
@@ -573,6 +602,17 @@ func (rs *ReplicationServer) DemoteVolume(ctx context.Context,
 
 			return nil, status.Error(codes.Internal, err.Error())
 		}
+	}
+
+	info, err = mirror.GetMirroringInfo(ctx)
+	if err != nil {
+		log.ErrorLog(ctx, err.Error())
+
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if info.IsPrimary() {
+		return nil, status.Error(codes.Internal, "volume/volume group has not been demoted, yet!")
 	}
 
 	return &replication.DemoteVolumeResponse{}, nil

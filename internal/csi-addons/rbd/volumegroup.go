@@ -301,9 +301,18 @@ func (vs *VolumeGroupServer) ModifyVolumeGroupMembership(
 	// resolve the volume group
 	vg, err := mgr.GetVolumeGroupByID(ctx, req.GetVolumeGroupId())
 	if err != nil {
+		if errors.Is(err, group.ErrRBDGroupNotFound) {
+			log.ErrorLog(ctx, "VolumeGroup %q doesn't exists", req.GetVolumeGroupId())
+			return nil, status.Errorf(
+				codes.NotFound,
+				"could not find volume group %q: %s",
+				req.GetVolumeGroupId(),
+				err.Error())
+		}
+
 		return nil, status.Errorf(
-			codes.NotFound,
-			"could not find volume group %q: %s",
+			codes.Internal,
+			"could not fetch volume group %q: %s",
 			req.GetVolumeGroupId(),
 			err.Error())
 	}
@@ -321,11 +330,50 @@ func (vs *VolumeGroupServer) ModifyVolumeGroupMembership(
 	}
 
 	vgrMirrorInfo, err := mirror.GetMirroringInfo(ctx)
+	if err != nil {
+		log.ErrorLog(ctx, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
+	}
 
-	// Skip modification of group if it's secondary
-	if !vgrMirrorInfo.IsPrimary() {
-		log.DebugLog(ctx, "skipping modification of group, as it is in secondary state")
+	sts, rErr := mirror.GetGlobalMirroringStatus(ctx)
+	if rErr != nil {
+		return nil, status.Error(codes.Internal, rErr.Error())
+	}
+
+	localStatus, rErr := sts.GetLocalSiteStatus()
+	if rErr != nil {
+		return nil, status.Error(codes.Internal, rErr.Error())
+	}
+
+	log.DebugLog(ctx, "local status is %v and local state is %v", localStatus.IsUP(), localStatus.GetState())
+	if !vgrMirrorInfo.IsPrimary() || (localStatus.IsUP() && localStatus.GetState() != librbd.MirrorGroupStatusStateStopped.String()) {
+		log.DebugLog(ctx, "skipping modification of group, as it is in secondary/promoting state")
 		return &volumegroup.ModifyVolumeGroupMembershipResponse{}, nil
+	}
+
+	remoteSiteStatus, err := sts.GetRemoteSiteStatus(ctx)
+	if err != nil {
+		log.DebugLog(ctx, "remotesitestatus failed")
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if (localStatus.IsUP() && localStatus.GetState() == librbd.MirrorGroupStatusStateStopped.String()) &&
+		(remoteSiteStatus.IsUP() && remoteSiteStatus.GetState() == librbd.MirrorGroupStatusStateStopped.String()) {
+		err = fmt.Errorf("both the groups are in primary state, resync needs to happen before modifying the group")
+		return nil, status.Errorf(
+			codes.Internal,
+			"failed to modify group %q, %v",
+			vg,
+			err)
+	}
+
+	if vgrMirrorInfo.GetState() == librbd.MirrorGroupEnabling.String() || vgrMirrorInfo.GetState() == librbd.MirrorGroupDisabling.String() {
+		err = fmt.Errorf("group is in either enabling/disabling mirror state")
+		return nil, status.Errorf(
+			codes.Internal,
+			"failed to modify group %q,there's an ongoing transaction on group: %v",
+			vg,
+			err)
 	}
 
 	beforeVolumes, err := vg.ListVolumes(ctx)
@@ -367,6 +415,23 @@ func (vs *VolumeGroupServer) ModifyVolumeGroupMembership(
 		if _, ok := beforeIDs[id]; !ok {
 			toAdd = append(toAdd, id)
 		}
+	}
+
+	// Skip modification if there is no change to volumes list that are part of group
+	if len(toRemove) == 0 && len(toAdd) == 0 {
+		return &volumegroup.ModifyVolumeGroupMembershipResponse{}, nil
+	}
+
+	// Disable mirroring before modifying the volume group
+	// extract the force option
+	force, err := getForceOption(ctx, req.GetParameters())
+	if err != nil {
+		return nil, err
+	}
+	err = rbd.DisableVolumeReplication(mirror, ctx, vgrMirrorInfo.IsPrimary(), force)
+	if err != nil {
+		log.DebugLog(ctx, "failed to disable mirroring before modifying volume group")
+		return nil, getGRPCError(err)
 	}
 
 	// remove the volume that should not be part of the group
@@ -426,6 +491,18 @@ func (vs *VolumeGroupServer) ModifyVolumeGroupMembership(
 				vg,
 				err)
 		}
+	}
+
+	// Enable mirroring after modification of volume group
+	// extract the mirroring mode
+	mirroringMode, err := getMirroringMode(ctx, req.GetParameters())
+	if err != nil {
+		return nil, err
+	}
+	err = mirror.EnableMirroring(ctx, mirroringMode)
+	if err != nil {
+		log.DebugLog(ctx, "failed to enable mirroring after modifying volume group")
+		return nil, getGRPCError(err)
 	}
 
 	csiVG, err := vg.ToCSI(ctx)
