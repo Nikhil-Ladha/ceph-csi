@@ -431,9 +431,9 @@ func validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
 		}
 	}
 	// Validate listeners JSON if provided
-	listeners, err := parseListeners(params["listeners"])
+	countOfListeners, err := validateListenersParameter(params["listeners"])
 	if err != nil {
-		return fmt.Errorf("invalid listeners parameter: %w", err)
+		return err
 	}
 	// Validate network mask if provided
 	err = validateNetworkMask(params["networkMask"])
@@ -442,11 +442,11 @@ func validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
 	}
 	networkMask := params["networkMask"]
 	// Must have EITHER listeners XOR networkMask
-	if len(listeners) == 0 && networkMask == "" {
+	if countOfListeners == 0 && networkMask == "" {
 		return errors.New("must specify either 'listeners' xor 'networkMask', but got neither")
 	}
-	if len(listeners) > 0 && networkMask != "" {
-		return errors.New("must specify either 'listeners' xor 'networkMask',but got both")
+	if countOfListeners > 0 && networkMask != "" {
+		return errors.New("must specify either 'listeners' xor 'networkMask', but got both")
 	}
 	// Validate QoS parameters - cannot mix RBD and NVMe-oF QoS
 	mutableParams := req.GetMutableParameters()
@@ -487,7 +487,7 @@ func validatePublishVolumeRequest(req *csi.ControllerPublishVolumeRequest) error
 	return util.ValidateControllerPublishVolumeRequest(req)
 }
 
-// parseListeners parses the listeners JSON parameter and validates its contents.
+// validateListenersParameter parses the listeners JSON parameter and validates its contents.
 // it possible to have zero listeners if networkMask is provided,
 // because in that case the gateway will automatically create listeners
 // for all interfaces in the specified network mask.
@@ -507,29 +507,13 @@ func validatePublishVolumeRequest(req *csi.ControllerPublishVolumeRequest) error
 //	}
 //
 // ].
-func parseListeners(listenersJSON string) ([]nvmeof.ListenerDetails, error) {
-	if listenersJSON == "" { // No "listeners" entry was provided
-		return []nvmeof.ListenerDetails{}, nil
-	}
-	var listeners []nvmeof.ListenerDetails
-	if err := json.Unmarshal([]byte(listenersJSON), &listeners); err != nil {
-		return nil, fmt.Errorf("failed to parse listeners JSON: %w", err)
+func validateListenersParameter(listenersJSON string) (int, error) {
+	listeners, err := nvmeof.SetupListeners(listenersJSON)
+	if err != nil {
+		return -1, err
 	}
 
-	if len(listeners) == 0 { // At least one listener is required
-		return nil, errors.New("at least one listener must be specified")
-	}
-
-	// Validate each listener
-	// Listener address can be empty. it will set to default 0.0.0.0
-	// Port can be empty (will use default - 4420).
-	for i, listener := range listeners {
-		if listener.Hostname == "" {
-			return nil, fmt.Errorf("listener %d: missing required fields (hostname)", i)
-		}
-	}
-
-	return listeners, nil
+	return len(listeners), nil
 }
 
 // Validate network mask CIDR format.
@@ -764,43 +748,10 @@ func (cs *Server) createNVMeoFResources(
 	params := req.GetParameters()
 
 	networkMask := params["networkMask"]
-	nvmeofData := &nvmeof.NVMeoFVolumeData{
-		SubsystemNQN:  params["subsystemNQN"],
-		NamespaceID:   0,   // will be set after namespace creation,
-		NamespaceUUID: "",  // will be set after namespace creation
-		ListenerInfo:  nil, // will be set after listener creation or retrieval
-		GatewayManagementInfo: nvmeof.GatewayConfig{
-			Address: params["nvmeofGatewayAddress"],
-		},
-		Security: nvmeof.NVMeoFSecurityConfig{
-			DhchapMode:          params["dhchapMode"],
-			AuthenticationKMSID: params["authenticationKMSID"],
-		},
-	}
-	if nvmeofGatewayPortStr := params["nvmeofGatewayPort"]; nvmeofGatewayPortStr != "" {
-		parsed, err := strconv.ParseUint(nvmeofGatewayPortStr, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("invalid nvmeofGatewayPort %s: %w", nvmeofGatewayPortStr, err)
-		}
-		nvmeofData.GatewayManagementInfo.Port = uint32(parsed)
-	}
+	nvmeofData := &nvmeof.NVMeoFVolumeData{}
 
-	// setup listeners (if provided, otherwise it will be set by gateway based on network mask)
-	listeners, err := parseListeners(params["listeners"])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse listeners: %w", err)
-	}
-	nvmeofData.ListenerInfo = listeners
-	// If listener port or address is empty, it will be set to default.
-	nvmeofData.SetListenersWithDefaults()
-
-	// If dhchapMode was explicitly provided and is not "none", and authenticationKMSID is empty,
-	// use a default KMS ID - RBD metadata KMS.
-	// In production, users should always provide a KMS ID when using DH-CHAP.
-	if nvmeofData.Security.DhchapMode != nvmeof.DHCHAPEmpty &&
-		nvmeofData.Security.DhchapMode != nvmeof.DHCHAPModeNone &&
-		nvmeofData.Security.AuthenticationKMSID == "" {
-		nvmeofData.Security.AuthenticationKMSID = "metadata"
+	if err := nvmeofData.SetFromParameters(params); err != nil {
+		return nil, fmt.Errorf("failed to set NVMe-oF volume data: %w", err)
 	}
 
 	// extract Qos parameters if any
