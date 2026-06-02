@@ -8,7 +8,7 @@ replace github.com/ceph/ceph-csi/api => ./api
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets v1.4.0
-	github.com/IBM/keyprotect-go-client v0.15.1
+	github.com/IBM/keyprotect-go-client v0.16.0
 	github.com/avast/retry-go/v4 v4.7.0
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
@@ -24,33 +24,33 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/vault/api v1.23.0
-	github.com/kubernetes-csi/csi-lib-utils v0.23.2
+	github.com/kubernetes-csi/csi-lib-utils v0.24.0
 	github.com/libopenstorage/secrets v0.0.0-20231011182615-5f4b25ceede1
 	github.com/pkg/xattr v0.4.12
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/automaxprocs v1.6.0
-	golang.org/x/crypto v0.50.0
-	golang.org/x/net v0.53.0
-	golang.org/x/sys v0.43.0
-	google.golang.org/grpc v1.81.0
+	golang.org/x/crypto v0.52.0
+	golang.org/x/net v0.54.0
+	golang.org/x/sys v0.45.0
+	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
-	k8s.io/api v0.36.0
-	k8s.io/apimachinery v0.36.0
-	k8s.io/cloud-provider v0.36.0
+	k8s.io/api v0.36.1
+	k8s.io/apimachinery v0.36.1
+	k8s.io/cloud-provider v0.36.1
 	k8s.io/klog/v2 v2.140.0
-	k8s.io/kubernetes v1.36.0
-	k8s.io/mount-utils v0.36.0
+	k8s.io/kubernetes v1.36.1
+	k8s.io/mount-utils v0.36.1
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
 )
 
 require (
 	// sigs.k8s.io/controller-runtime wants this version, it gets replaced below
 	k8s.io/client-go v12.0.0+incompatible
-	sigs.k8s.io/controller-runtime v0.23.1-0.20260424122448-c8b4b9d61fbd
+	sigs.k8s.io/controller-runtime v0.24.1
 )
 
-replace k8s.io/client-go => k8s.io/client-go v0.36.0
+replace k8s.io/client-go => k8s.io/client-go v0.36.1
 
 exclude (
 	// missing tag, referred to by github.com/hashicorp/go-kms-wrapping@v0.5.1
@@ -147,8 +147,8 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/term v0.42.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/term v0.43.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
@@ -156,11 +156,11 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apiextensions-apiserver v0.36.0 // indirect
-	k8s.io/apiserver v0.36.0 // indirect
-	k8s.io/component-base v0.36.0 // indirect
-	k8s.io/controller-manager v0.36.0 // indirect
-	k8s.io/csi-translation-lib v0.36.0 // indirect
+	k8s.io/apiextensions-apiserver v0.36.1 // indirect
+	k8s.io/apiserver v0.36.1 // indirect
+	k8s.io/component-base v0.36.1 // indirect
+	k8s.io/controller-manager v0.36.1 // indirect
+	k8s.io/csi-translation-lib v0.36.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
