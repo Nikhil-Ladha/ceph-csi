@@ -19,6 +19,7 @@ package rbd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 
 	librbd "github.com/ceph/go-ceph/rbd"
@@ -99,6 +100,75 @@ func HasQoSParams(params map[string]string) bool {
 	}
 
 	return false
+}
+
+// nbdQoSHandler implements QoSHandler for traditional NBD QoS (rbd-nbd mounter).
+type nbdQoSHandler struct {
+	volume *rbdVolume
+}
+
+// newNBDQoSHandler creates a new NBD QoS handler.
+func newNBDQoSHandler(volume *rbdVolume) QoSHandler {
+	return &nbdQoSHandler{volume: volume}
+}
+
+// HasParams checks if traditional NBD QoS parameters are present in the request.
+func (h *nbdQoSHandler) HasParams(params map[string]string) bool {
+	return HasQoSParams(params)
+}
+
+// Validate validates traditional NBD QoS parameters.
+func (h *nbdQoSHandler) Validate(params map[string]string) error {
+	return validateNBDQoSParams(params)
+}
+
+// validateNBDQoSParams validates traditional NBD QoS parameters.
+// Ensures all numeric values are valid and positive.
+func validateNBDQoSParams(params map[string]string) error {
+	// All NBD QoS parameter keys that accept numeric values
+	numericParams := []string{
+		baseIops, maxIops, baseReadIops, maxReadIops, baseWriteIops, maxWriteIops,
+		baseBps, maxBps, baseReadBps, maxReadBps, baseWriteBps, maxWriteBps,
+		iopsPerGiB, readIopsPerGiB, writeIopsPerGiB,
+		bpsPerGiB, readBpsPerGiB, writeBpsPerGiB,
+		baseVolSizeBytes,
+	}
+
+	for _, key := range numericParams {
+		if val, ok := params[key]; ok && val != "" {
+			parsed, err := strconv.ParseInt(val, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid value for %s: %s, must be a valid integer", key, val)
+			}
+			// Allow zero for base limits (can be omitted), but not negative
+			if parsed < 0 {
+				return fmt.Errorf("invalid value for %s: %s, must be non-negative", key, val)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Apply sets and applies traditional NBD QoS to the rbd-nbd device.
+func (h *nbdQoSHandler) Apply(ctx context.Context, params map[string]string) error {
+	if err := h.volume.SetQOS(ctx, params); err != nil {
+		return err
+	}
+
+	if err := h.volume.ApplyQOS(ctx); err != nil {
+		return err
+	}
+
+	return h.volume.SaveQOS(ctx, params)
+}
+
+// Clear removes all traditional NBD QoS settings.
+func (h *nbdQoSHandler) Clear(ctx context.Context) error {
+	// Pass empty params to clear QoS settings.
+	emptyParams := map[string]string{}
+
+	return h.Apply(ctx, emptyParams)
 }
 
 func parseQosParams(
