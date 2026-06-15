@@ -150,6 +150,38 @@ func validateStriping(parameters map[string]string) error {
 	return nil
 }
 
+// validateQoSParameters validates QoS parameters from VolumeAttributesClass
+// based on the configured mounter type. The cgroup QoS params (maxReadIops,
+// maxWriteIops, maxReadBps, maxWriteBps) overlap with NBD max-limit params,
+// so disambiguation must be mounter-based.
+func validateQoSParameters(mutableParams map[string]string, mounter string) error {
+	if mounter == rbdNbdMounter {
+		// NBD mounter: only NBD QoS params are valid.
+		// The shared keys (maxReadIops, etc.) serve as NBD max limits here.
+		if HasQoSParams(mutableParams) {
+			return validateNBDQoSParams(mutableParams)
+		}
+
+		return nil
+	}
+
+	// krbd mounter: only cgroup v2 QoS params are supported.
+	// Reject any NBD-specific params that won't be applied via cgroup.
+	if HasQoSParams(mutableParams) {
+		return fmt.Errorf(
+			"NBD QoS parameters (baseIops, baseReadIops, etc.) are not supported with %q mounter, "+
+				"use cgroup QoS parameters (maxReadIops, maxWriteIops, maxReadBps, maxWriteBps)", mounter)
+	}
+
+	if hasCgroupQoSParams(mutableParams) {
+		if err := validateCgroupQoSParams(mutableParams); err != nil {
+			return fmt.Errorf("invalid cgroup QoS parameters: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // parseVolCreateRequest take create volume `request` argument and make use of the
 // request arguments for subsequent calls.
 func (cs *ControllerServer) parseVolCreateRequest(
@@ -230,10 +262,19 @@ func (cs *ControllerServer) parseVolCreateRequest(
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// parse QOS parameters from mutable parameters
-	err = rbdVol.SetQOS(ctx, req.GetMutableParameters())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	// Validate QoS parameters from VolumeAttributesClass before creating the image.
+	// This ensures we fail early if parameters are invalid, avoiding orphaned resources.
+	mutableParams := req.GetMutableParameters()
+	if len(mutableParams) > 0 {
+		err = validateQoSParameters(mutableParams, rbdVol.Mounter)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+
+		// Store BaseVolSize for capacity-based QoS calculations.
+		if v, ok := mutableParams[baseVolSizeBytes]; ok && v != "" {
+			rbdVol.BaseVolSize = v
+		}
 	}
 
 	err = rbdVol.Connect(cr)
@@ -814,19 +855,18 @@ func (cs *ControllerServer) createBackingImage(
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	// Apply Qos parameters to rbd image.
-	err = rbdVol.ApplyQOS(ctx)
-	if err != nil {
-		log.ErrorLog(ctx, "failed to apply QOS for rbd image: %s with error: %v", rbdVol, err)
+	// Apply QoS parameters from VolumeAttributesClass if present.
+	// This handles both traditional NBD QoS and cgroup v2 QoS.
+	if len(mutableParameters) > 0 {
+		// Set RequestedVolSize for QoS capacity-based calculations.
+		rbdVol.RequestedVolSize = rbdVol.VolSize
 
-		return status.Error(codes.Internal, err.Error())
-	}
-	// Save Qos parameters from mutable parameters in Image metadata, we will use it while resize volume.
-	err = rbdVol.SaveQOS(ctx, mutableParameters)
-	if err != nil {
-		log.ErrorLog(ctx, "failed to save QOS for rbd image: %s with error: %v", rbdVol, err)
+		err = rbdVol.modifyVolumeAttributes(ctx, mutableParameters)
+		if err != nil {
+			log.ErrorLog(ctx, "failed to apply QoS for rbd image: %s with error: %v", rbdVol, err)
 
-		return status.Error(codes.Internal, err.Error())
+			return status.Error(codes.Internal, err.Error())
+		}
 	}
 
 	return nil
@@ -2022,23 +2062,22 @@ func (cs *ControllerServer) ControllerModifyVolume(
 	}
 	defer cs.OperationLocks.ReleaseModifyLock(volID)
 
-	// QoS parameters only work with rbd-nbd mounter
-	usesNBD, err := rbdVol.UsesNBDMounter(ctx)
+	// Resolve the mounter from image metadata since generateVolumeFromVolumeID
+	// does not populate it. This must happen before QoS parameter validation
+	// so the correct mounter-specific rules are applied.
+	_, err = rbdVol.UsesNBDMounter(ctx)
 	switch {
 	case errors.Is(err, rbderrors.ErrMounterUnknown):
-		// Volume created before mounter tracking - proceed with warning
 		log.WarningLog(ctx, "volume %s has unknown mounter type (created before mounter tracking), "+
 			"proceeding with modification but QoS may not work if volume does not use rbd-nbd", volID)
 	case err != nil:
 		log.ErrorLog(ctx, "failed to check mounter type for volume %s: %v", volID, err)
 
 		return nil, status.Errorf(codes.Internal, "failed to determine volume mounter type: %v", err)
-	case !usesNBD:
-		log.ErrorLog(ctx, "volume %s uses mounter %q, QoS modification requires %q",
-			volID, rbdVol.Mounter, rbdNbdMounter)
+	}
 
-		return nil, status.Errorf(codes.InvalidArgument,
-			"volume modification requires rbd-nbd mounter, volume uses %q", rbdVol.Mounter)
+	if err = validateQoSParameters(mutableParameters, rbdVol.Mounter); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	// set RequestedVolSize, because calcQosBasedOnCapacity use it.
