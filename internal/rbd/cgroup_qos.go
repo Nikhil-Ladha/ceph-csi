@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	librbd "github.com/ceph/go-ceph/rbd"
+	"golang.org/x/sys/unix"
 
 	"github.com/ceph/ceph-csi/internal/util/log"
 )
@@ -63,31 +64,13 @@ const (
 	qosMetadataMaxReadBps   = qosMetadataKeyPrefix + "cgroup_qos_max_read_bps"
 	qosMetadataMaxWriteBps  = qosMetadataKeyPrefix + "cgroup_qos_max_write_bps"
 
-	// cgroup v2 base path.
-	cgroupV2BasePath = "/sys/fs/cgroup"
-
-	// Kubernetes cgroup slices based on QoS class.
-	// BestEffort and Burstable are nested under kubepods.slice parent.
-	kubepodsBestEffortSlice = "kubepods.slice/kubepods-besteffort.slice"
-	kubepodsBurstableSlice  = "kubepods.slice/kubepods-burstable.slice"
-	kubepodsGuaranteedSlice = "kubepods.slice"
-
 	// io.max file for cgroup v2.
 	ioMaxFile = "io.max"
-)
 
-// qosClassInfo holds pre-computed cgroup path information for each QoS class.
-// Ordered by most common QoS class in production (Guaranteed > Burstable > BestEffort)
-// to minimize stat() syscalls on average.
-var qosClassInfo = [...]struct {
-	name      string
-	sliceName string
-	podPrefix string
-}{
-	{"Guaranteed", kubepodsGuaranteedSlice, "kubepods-pod"},
-	{"Burstable", kubepodsBurstableSlice, "kubepods-burstable-pod"},
-	{"BestEffort", kubepodsBestEffortSlice, "kubepods-besteffort-pod"},
-}
+	// Cgroup v2 base paths for systemd and cgroupfs drivers.
+	cgroupV2SystemdBase  = "/sys/fs/cgroup/kubepods.slice"
+	cgroupV2CgroupfsBase = "/sys/fs/cgroup/kubepods"
+)
 
 // qosParamToMetadataKey maps VolumeAttributesClass parameter keys to RBD image metadata keys.
 // Metadata keys are prefixed with `.rbd.csi.ceph.com/` to prevent copying during clone/snapshot.
@@ -198,35 +181,18 @@ func hasCgroupQoSParams(params map[string]string) bool {
 }
 
 // getDeviceID returns the device major:minor number for the given device path.
-func getDeviceID(ctx context.Context, devicePath string) (string, error) {
-	// Get the real path if devicePath is a symlink.
+func getDeviceID(devicePath string) (string, error) {
 	realPath, err := filepath.EvalSymlinks(devicePath)
 	if err != nil {
-		log.ErrorLog(ctx, "failed to resolve symlink for device %s: %v", devicePath, err)
-
-		return "", err
+		return "", fmt.Errorf("failed to resolve symlink for device %s: %w", devicePath, err)
 	}
 
-	// Read /proc/partitions to get major:minor for the device.
-	data, err := os.ReadFile("/proc/partitions")
-	if err != nil {
-		log.ErrorLog(ctx, "failed to read /proc/partitions: %v", err)
-
-		return "", err
+	var st unix.Stat_t
+	if err := unix.Stat(realPath, &st); err != nil {
+		return "", fmt.Errorf("failed to stat device %s: %w", realPath, err)
 	}
 
-	deviceName := filepath.Base(realPath)
-	for line := range strings.SplitSeq(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[3] == deviceName {
-			major := fields[0]
-			minor := fields[1]
-
-			return fmt.Sprintf("%s:%s", major, minor), nil
-		}
-	}
-
-	return "", fmt.Errorf("device %s not found in /proc/partitions", deviceName)
+	return fmt.Sprintf("%d:%d", unix.Major(st.Rdev), unix.Minor(st.Rdev)), nil
 }
 
 // formatIOMax formats the io.max line for cgroup v2.
@@ -243,30 +209,43 @@ func writeIOMax(ioMaxPath, ioMaxLine string) error {
 	return os.WriteFile(ioMaxPath, []byte(ioMaxLine+"\n"), 0o600)
 }
 
-// findPodCgroupPath tries to find the pod's cgroup path by attempting all QoS classes.
-// Optimized to minimize allocations and stat() syscalls per lookup.
+// podCgroupCandidates returns candidate cgroup paths for the given pod UID,
+// covering both the systemd and cgroupfs cgroup drivers.
+// Systemd paths use underscores in place of dashes; cgroupfs paths keep the
+// original dashed UUID.
+// Ordered: Guaranteed > Burstable > BestEffort within each driver, systemd first.
+func podCgroupCandidates(podUID string) []string {
+	uid := strings.ReplaceAll(podUID, "-", "_")
+
+	return []string{
+		// systemd cgroup driver
+		filepath.Join(cgroupV2SystemdBase,
+			"kubepods-pod"+uid+".slice"),
+		filepath.Join(cgroupV2SystemdBase, "kubepods-burstable.slice",
+			"kubepods-burstable-pod"+uid+".slice"),
+		filepath.Join(cgroupV2SystemdBase, "kubepods-besteffort.slice",
+			"kubepods-besteffort-pod"+uid+".slice"),
+
+		// cgroupfs cgroup driver
+		filepath.Join(cgroupV2CgroupfsBase, "pod"+podUID),
+		filepath.Join(cgroupV2CgroupfsBase, "burstable", "pod"+podUID),
+		filepath.Join(cgroupV2CgroupfsBase, "besteffort", "pod"+podUID),
+	}
+}
+
+// findPodCgroupPath tries to find the pod's cgroup v2 path by probing
+// candidates for both the systemd and cgroupfs cgroup drivers.
 func findPodCgroupPath(ctx context.Context, podUID string) (string, error) {
 	if podUID == "" {
 		return "", errors.New("pod UID is empty")
 	}
 
-	// Normalize pod UID once: replace hyphens with underscores.
-	normalizedUID := strings.ReplaceAll(podUID, "-", "_")
+	for _, candidate := range podCgroupCandidates(podUID) {
+		ioMaxPath := filepath.Join(candidate, ioMaxFile)
+		if _, err := os.Stat(ioMaxPath); err == nil {
+			log.DebugLog(ctx, "found pod cgroup path: %s", candidate)
 
-	// Try each QoS class path using pre-computed path prefixes.
-	// Ordered by most common in production: Guaranteed → Burstable → BestEffort.
-	// This minimizes average syscalls (1-2 stat() calls instead of always 3).
-	for i := range qosClassInfo {
-		qos := &qosClassInfo[i]
-		// Construct pod slice name directly (e.g., "kubepods-guaranteed-pod<uid>.slice").
-		// Using string concatenation instead of fmt.Sprintf reduces allocations.
-		podSliceName := qos.podPrefix + normalizedUID + ".slice"
-		podPath := filepath.Join(cgroupV2BasePath, qos.sliceName, podSliceName)
-
-		if _, err := os.Stat(podPath); err == nil {
-			log.DebugLog(ctx, "found pod cgroup path: %s for QoS class: %s", podPath, qos.name)
-
-			return podPath, nil
+			return candidate, nil
 		}
 	}
 
@@ -405,7 +384,7 @@ func (rv *rbdVolume) applyCgroupQoSForVolume(ctx context.Context, devicePath, po
 
 	// Get device ID (major:minor).
 	qos := parseCgroupQoSParams(qosParams)
-	qos.deviceID, err = getDeviceID(ctx, devicePath)
+	qos.deviceID, err = getDeviceID(devicePath)
 	if err != nil {
 		return fmt.Errorf("failed to get device ID for %s: %w", devicePath, err)
 	}
