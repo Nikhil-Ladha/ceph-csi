@@ -1,7 +1,6 @@
 ARG SRC_DIR="/go/src/github.com/ceph/ceph-csi/"
 ARG GO_ARCH
 ARG BASE_IMAGE
-ARG FINAL_BASE_IMAGE="quay.io/centos/centos:stream9-minimal"
 
 FROM ${BASE_IMAGE} as updated_base
 
@@ -9,9 +8,14 @@ FROM ${BASE_IMAGE} as updated_base
 # https://github.com/ceph/ceph-container/issues/2034
 # https://github.com/ceph/ceph-container/issues/2141 are fixed.
 RUN true \
-    && dnf -y reinstall https://download.ceph.com/rpm-${CEPH_VERSION}/el9/noarch/ceph-release-1-1.el9.noarch.rpm \
-    && ( dnf config-manager --disable tcmu-runner,tcmu-runner-source,tcmu-runner-noarch,ceph-iscsi,ganesha || true ) \
-    && true
+     && . /etc/os-release \
+     && OS_NAME="$ID" \
+     && OS_VERSION="$(echo $VERSION_ID | cut -d. -f1)" \
+     && (if [ "$OS_NAME" = centos -a "$OS_VERSION" = 8 ]; then find /etc/yum.repos.d/ -name '*.repo' -exec sed -i -e 's|^mirrorlist=|#mirrorlist=|g' -e 's|^#baseurl=http://mirror.centos.org|baseurl=https://vault.centos.org|g'  {} \; ; fi ) \
+     && if [ ! -f /etc/yum.repos.d/ceph.repo -a "$CEPH_IS_DEVEL" = true ]; then if [ -z "$CEPH_SHA1" ]; then CEPH_SHA1="$(sed -n 's/.*CEPH_GIT_VER *= *"\(.*\)".*/\1/p' /usr/bin/ceph)"; fi ; yum reinstall -y "$(curl -fs "https://shaman.ceph.com/api/search/?project=ceph&distros=${OS_NAME}/${OS_VERSION}/$(uname -m)&flavor=default&ref=${CEPH_REF}&sha1=${CEPH_SHA1:-latest}" | jq -r .[0].url)/noarch/ceph-release-1-0.el${OS_VERSION}.noarch.rpm"; fi \
+     && if [ ! -f /etc/yum.repos.d/ceph.repo -a "$CEPH_IS_DEVEL" != true ]; then yum reinstall -y "https://download.ceph.com/rpm-${CEPH_REF}/el${OS_VERSION}/noarch/ceph-release-1-1.el${OS_VERSION}.noarch.rpm"; fi \
+     && ( dnf config-manager --disable tcmu-runner,tcmu-runner-source,tcmu-runner-noarch,ceph-iscsi,ganesha || true ) \
+     && true
 
 RUN mkdir -p /etc/selinux && touch /etc/selinux/config
 
@@ -43,7 +47,7 @@ RUN source /build.env && \
 RUN ${GOROOT}/bin/go version && ${GOROOT}/bin/go env
 
 # other/conflicting versions of protobuf get installed as dependency
-RUN dnf -y remove protobuf
+RUN dnf -y --setopt=tsflags=noscripts remove protobuf
 
 RUN dnf -y install --nodocs \
 	librados-devel librbd-devel libcephfs-devel \
@@ -72,10 +76,9 @@ COPY . ${SRC_DIR}
 RUN make cephcsi GO_BUILD_VERBOSE="${GO_BUILD_VERBOSE}"
 
 #-- Final container
-FROM ${FINAL_BASE_IMAGE}
+FROM updated_base
 
 ARG SRC_DIR
-ARG CEPH_VERSION
 
 LABEL maintainers="Ceph-CSI Authors" \
     version=${CSI_IMAGE_VERSION} \
@@ -83,13 +86,6 @@ LABEL maintainers="Ceph-CSI Authors" \
     description="Ceph-CSI Plugin"
 
 COPY --from=builder ${SRC_DIR}/_output/cephcsi /usr/local/bin/cephcsi
-
-RUN true \
-  && rpm -ivh https://download.ceph.com/rpm-${CEPH_VERSION}/el9/noarch/ceph-release-1-1.el9.noarch.rpm \
-  && microdnf -y install kmod nfs-utils nvme-cli epel-release psmisc e2fsprogs xfsprogs cryptsetup attr --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
-  && microdnf -y install thrift librados2 librbd1 libcephfs2 ceph-common ceph-fuse rbd-nbd --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
-  && microdnf clean all \
-  && true
 
 # verify that all dynamically linked libraries are available
 RUN [ $(ldd /usr/local/bin/cephcsi | grep -c '=> not found') = '0' ]

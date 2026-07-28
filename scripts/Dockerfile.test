@@ -7,8 +7,7 @@
 # Operating System, so generated binaries and versions of dependencies may be a
 # little different.
 #
-
-FROM quay.io/fedora/fedora:latest
+FROM quay.ceph.io/ceph-ci/ceph:wip-rbd-cgsm-base
 
 ARG GOPATH=/go
 ARG GOROOT=/usr/local/go
@@ -25,6 +24,16 @@ COPY build.env /
 
 RUN mkdir -p /etc/selinux && touch /etc/selinux/config
 
+RUN true \
+     && . /etc/os-release \
+     && OS_NAME="$ID" \
+     && OS_VERSION="$(echo $VERSION_ID | cut -d. -f1)" \
+     && (if [ "$OS_NAME" = centos -a "$OS_VERSION" = 8 ]; then find /etc/yum.repos.d/ -name '*.repo' -exec sed -i -e 's|^mirrorlist=|#mirrorlist=|g' -e 's|^#baseurl=http://mirror.centos.org|baseurl=https://vault.centos.org|g'  {} \; ; fi ) \
+     && if [ ! -f /etc/yum.repos.d/ceph.repo -a "$CEPH_IS_DEVEL" = true ]; then if [ -z "$CEPH_SHA1" ]; then CEPH_SHA1="$(sed -n 's/.*CEPH_GIT_VER *= *"\(.*\)".*/\1/p' /usr/bin/ceph)"; fi ; yum reinstall -y "$(curl -fs "https://shaman.ceph.com/api/search/?project=ceph&distros=${OS_NAME}/${OS_VERSION}/$(uname -m)&flavor=default&ref=${CEPH_REF}&sha1=${CEPH_SHA1:-latest}" | jq -r .[0].url)/noarch/ceph-release-1-0.el${OS_VERSION}.noarch.rpm"; fi \
+     && if [ ! -f /etc/yum.repos.d/ceph.repo -a "$CEPH_IS_DEVEL" != true ]; then yum reinstall -y "https://download.ceph.com/rpm-${CEPH_REF}/el${OS_VERSION}/noarch/ceph-release-1-1.el${OS_VERSION}.noarch.rpm"; fi \
+     && ( dnf config-manager --disable tcmu-runner,tcmu-runner-source,tcmu-runner-noarch,ceph-iscsi,ganesha || true ) \
+     && true
+
 RUN set -x \
     && source /build.env \
     && \
@@ -34,7 +43,6 @@ RUN set -x \
 	make \
 	gcc \
 	findutils \
-	awk \
 	librados-devel \
         libcephfs-devel \
 	librbd-devel \
@@ -43,13 +51,13 @@ RUN set -x \
 	rubygems \
 	ShellCheck \
 	codespell \
-	yamllint \
 	npm \
 	diffutils \
 	python3-prettytable \
 	pylint \
     && dnf -y update \
     && dnf -y clean all \
+    && python3 -m ensurepip && python3 -m pip install yamllint \
     && gem install mdl -v 0.15.0 \
     && mkdir -p ${GOROOT} \
     && curl -L https://go.dev/dl/go${GOLANG_VERSION}.linux-${GOARCH}.tar.gz  \
