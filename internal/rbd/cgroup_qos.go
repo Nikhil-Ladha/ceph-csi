@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -64,6 +66,9 @@ const (
 	qosMetadataMaxReadBps   = qosMetadataKeyPrefix + "cgroup_qos_max_read_bps"
 	qosMetadataMaxWriteBps  = qosMetadataKeyPrefix + "cgroup_qos_max_write_bps"
 
+	// cgroupQoSMaxLimit is the cgroup v2 value for unlimited I/O.
+	cgroupQoSMaxLimit = "max"
+
 	// io.max file for cgroup v2.
 	ioMaxFile = "io.max"
 
@@ -99,6 +104,11 @@ type cgroupQoSHandler struct {
 // newCgroupQoSHandler creates a new cgroup QoS handler.
 func newCgroupQoSHandler(volume *rbdVolume) QoSHandler {
 	return &cgroupQoSHandler{volume: volume}
+}
+
+// cgroupQoSKnownKeys returns the cgroup v2 QoS parameter keys.
+func cgroupQoSKnownKeys() []string {
+	return slices.Collect(maps.Keys(qosParamToMetadataKey))
 }
 
 // HasParams checks if cgroup v2 QoS parameters are present in the request.
@@ -146,10 +156,10 @@ type cgroupQoS struct {
 // parseCgroupQoSParams extracts cgroup v2 QoS parameters from VolumeAttributesClass.
 func parseCgroupQoSParams(params map[string]string) *cgroupQoS {
 	qos := &cgroupQoS{
-		maxReadIops:  "max",
-		maxWriteIops: "max",
-		maxReadBps:   "max",
-		maxWriteBps:  "max",
+		maxReadIops:  cgroupQoSMaxLimit,
+		maxWriteIops: cgroupQoSMaxLimit,
+		maxReadBps:   cgroupQoSMaxLimit,
+		maxWriteBps:  cgroupQoSMaxLimit,
 	}
 
 	if val, ok := params[maxReadIops]; ok && val != "" {
@@ -288,12 +298,16 @@ func (qos *cgroupQoS) applyCgroupQoS(ctx context.Context, podUID string) error {
 func validateCgroupQoSParams(params map[string]string) error {
 	for key := range qosParamToMetadataKey {
 		if val, ok := params[key]; ok && val != "" {
+			// "max" means unlimited (removes the limit).
+			if val == cgroupQoSMaxLimit {
+				continue
+			}
 			parsed, err := strconv.ParseInt(val, 10, 64)
 			if err != nil {
-				return fmt.Errorf("invalid value for %s: %s, must be a positive integer", key, val)
+				return fmt.Errorf("invalid value for %s: %s, must be a non-negative integer or %q", key, val, cgroupQoSMaxLimit)
 			}
-			if parsed <= 0 {
-				return fmt.Errorf("invalid value for %s: %s, must be greater than 0", key, val)
+			if parsed < 0 {
+				return fmt.Errorf("invalid value for %s: %s, must be a non-negative integer or %q", key, val, cgroupQoSMaxLimit)
 			}
 		}
 	}
