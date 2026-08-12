@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -88,6 +89,14 @@ type SubVolumeClient interface {
 	UnsetAllMetadata(keys []string) error
 	// ListMetadata gets the metadata for the subvolume.
 	ListMetadata() (map[string]string, error)
+
+	// PinVolume sets an MDS pinning policy on the subvolume.
+	// pinType is one of "export", "distributed" or "random".
+	// pinSetting is the value for the pin, its meaning depends on pinType:
+	//   - export:      MDS rank as an integer (e.g. "2"), or "-1" to unpin
+	//   - distributed: "1" to enable or "0" to disable
+	//   - random:      a float in the range 0.0-1.0
+	PinVolume(ctx context.Context, pinType, pinSetting string) error
 }
 
 // subVolumeClient implements SubVolumeClient interface.
@@ -322,4 +331,45 @@ func checkSubvolumeHasFeature(feature string, subVolFeatures []string) bool {
 	// The subvolume "features" are based on the internal version of the subvolume.
 	// Verify if subvolume supports the required feature.
 	return slices.Contains(subVolFeatures, feature)
+}
+
+// PinVolume sets an MDS pinning policy on the subvolume.
+// pinType can be "export", "distributed" or "random".
+// pinSetting is the value for the pin (e.g. MDS rank "2", "true"/"false").
+//
+// go-ceph's typed PinSubVolume helper does not accept a subvolume group, so it
+// would always target Ceph's default group and fail for subvolumes created in
+// a non-default group (as ceph-csi does). To support any group, the "fs
+// subvolume pin" manager command is issued directly with the group_name set.
+//
+// Similar To:
+//
+//	ceph fs subvolume pin <vol_name> <sub_name> <pin_type> <pin_setting> \
+//	  --group_name=<group>
+func (s *subVolumeClient) PinVolume(ctx context.Context, pinType, pinSetting string) error {
+	cmd := map[string]string{
+		"prefix":      "fs subvolume pin",
+		"format":      "json",
+		"vol_name":    s.FsName,
+		"sub_name":    s.VolID,
+		"group_name":  s.SubvolumeGroup,
+		"pin_type":    pinType,
+		"pin_setting": pinSetting,
+	}
+
+	buf, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pin command for subvolume %s: %w", s.VolID, err)
+	}
+
+	out, status, err := s.conn.MgrCommand([][]byte{buf})
+	if err != nil {
+		return fmt.Errorf("failed to pin subvolume %s in fs %s (group %s): %w",
+			s.VolID, s.FsName, s.SubvolumeGroup, err)
+	}
+
+	log.DebugLog(ctx, "cephfs: pinned subvolume %s in fs %s (group %s), type=%s setting=%s: status=%q output=%q",
+		s.VolID, s.FsName, s.SubvolumeGroup, pinType, pinSetting, status, string(out))
+
+	return nil
 }
