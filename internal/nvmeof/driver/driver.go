@@ -66,6 +66,7 @@ func (d *nvmeofDriver) Run(conf *util.Config) {
 			csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		})
 
 		cd.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
@@ -73,6 +74,10 @@ func (d *nvmeofDriver) Run(conf *util.Config) {
 			csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 			csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 			csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
+		})
+
+		cd.AddGroupControllerServiceCapabilities([]csi.GroupControllerServiceCapability_RPC_Type{
+			csi.GroupControllerServiceCapability_RPC_CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT,
 		})
 	}
 
@@ -95,6 +100,7 @@ func (d *nvmeofDriver) Run(conf *util.Config) {
 			log.FatalLogMsg("failed to initialize controller server: %v", err)
 		}
 		srv.CS = cs
+		srv.GS = csicommon.ToGroupControllerServer(srv.CS)
 	default:
 		ns, err := nodeserver.NewNodeServer(cd, conf.NodeID, conf.Vtype)
 		if err != nil {
@@ -106,6 +112,7 @@ func (d *nvmeofDriver) Run(conf *util.Config) {
 			log.FatalLogMsg("failed to initialize controller server: %v", err)
 		}
 		srv.CS = cs
+		srv.GS = csicommon.ToGroupControllerServer(srv.CS)
 	}
 
 	server.Start(conf.Endpoint, srv, csicommon.MiddlewareServerOptionConfig{

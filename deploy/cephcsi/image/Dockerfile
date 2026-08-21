@@ -49,7 +49,7 @@ RUN ${GOROOT}/bin/go version && ${GOROOT}/bin/go env
 # other/conflicting versions of protobuf get installed as dependency
 RUN dnf -y --setopt=tsflags=noscripts remove protobuf
 
-RUN dnf -y install --nodocs \
+RUN dnf -y install --enablerepo=crb --nodocs \
 	librados-devel librbd-devel libcephfs-devel \
 	/usr/bin/cc \
 	make \
