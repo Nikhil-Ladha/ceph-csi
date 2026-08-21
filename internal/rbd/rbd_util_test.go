@@ -19,16 +19,65 @@ package rbd
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ceph/go-ceph/rados"
 	librbd "github.com/ceph/go-ceph/rbd"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	rbderrors "github.com/ceph/ceph-csi/internal/rbd/errors"
 	"github.com/ceph/ceph-csi/internal/util"
 )
+
+func TestIsClone(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		imageName  string
+		parentName string
+		want       bool
+	}{
+		{
+			name:       "no parent",
+			imageName:  "myimage",
+			parentName: "",
+			want:       false,
+		},
+		{
+			name:       "parent is the temp clone of this image",
+			imageName:  "myimage",
+			parentName: (&rbdVolume{rbdImage: rbdImage{RbdImageName: "myimage"}}).generateTempCloneName(),
+			want:       true,
+		},
+		{
+			name:       "parent is a different image",
+			imageName:  "myimage",
+			parentName: "otherimage",
+			want:       false,
+		},
+		{
+			name:       "parent ends with temp suffix but belongs to a different image",
+			imageName:  "myimage",
+			parentName: (&rbdVolume{rbdImage: rbdImage{RbdImageName: "otherimage"}}).generateTempCloneName(),
+			want:       false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rv := &rbdVolume{
+				rbdImage: rbdImage{
+					RbdImageName: tt.imageName,
+					ParentName:   tt.parentName,
+				},
+			}
+			assert.Equal(t, tt.want, rv.isClone())
+		})
+	}
+}
 
 func TestHasSnapshotFeature(t *testing.T) {
 	t.Parallel()
@@ -443,4 +492,76 @@ func Test_shouldRetryVolumeGeneration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVolumeInfo(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	origDir := volumeInfoDir
+	volumeInfoDir = tmpDir
+	t.Cleanup(func() { volumeInfoDir = origDir })
+
+	t.Run("stash block mode volume", func(t *testing.T) {
+		t.Parallel()
+		volID := "vol-block-001"
+		err := stashVolumeInfo(volID, &volumeInfo{IsBlockMode: true})
+		require.NoError(t, err)
+
+		fPath := filepath.Join(tmpDir, volID+".json")
+		_, statErr := os.Stat(fPath)
+		require.NoError(t, statErr, "stashed file should exist")
+
+		info, err := lookupVolumeInfo(volID)
+		require.NoError(t, err)
+		assert.True(t, info.IsBlockMode)
+	})
+
+	t.Run("stash filesystem mode volume", func(t *testing.T) {
+		t.Parallel()
+		volID := "vol-fs-002"
+		err := stashVolumeInfo(volID, &volumeInfo{IsBlockMode: false})
+		require.NoError(t, err)
+
+		info, err := lookupVolumeInfo(volID)
+		require.NoError(t, err)
+		assert.False(t, info.IsBlockMode)
+	})
+
+	t.Run("lookup non-existent volume", func(t *testing.T) {
+		t.Parallel()
+		info, err := lookupVolumeInfo("vol-does-not-exist")
+		assert.Nil(t, info)
+		assert.True(t, os.IsNotExist(err))
+	})
+
+	t.Run("lookup corrupted JSON", func(t *testing.T) {
+		t.Parallel()
+		fPath := filepath.Join(tmpDir, "vol-corrupt.json")
+		err := os.WriteFile(fPath, []byte("not-valid-json"), 0o600)
+		require.NoError(t, err)
+
+		info, err := lookupVolumeInfo("vol-corrupt")
+		assert.Nil(t, info)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to unmarshal volume info")
+	})
+
+	t.Run("remove existing volume info", func(t *testing.T) {
+		t.Parallel()
+		volID := "vol-to-remove"
+		err := stashVolumeInfo(volID, &volumeInfo{IsBlockMode: false})
+		require.NoError(t, err)
+
+		err = removeVolumeInfo(volID)
+		require.NoError(t, err)
+
+		_, err = lookupVolumeInfo(volID)
+		assert.True(t, os.IsNotExist(err))
+	})
+
+	t.Run("remove non-existent volume info", func(t *testing.T) {
+		t.Parallel()
+		err := removeVolumeInfo("vol-never-existed")
+		assert.NoError(t, err)
+	})
 }

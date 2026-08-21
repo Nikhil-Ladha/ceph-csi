@@ -77,15 +77,13 @@ func (mgr *rbdManager) GetVolumeByID(ctx context.Context, id string) (types.Volu
 
 	volume, err := GenVolFromVolID(ctx, id, creds, mgr.secrets)
 	if err != nil {
+		volume.Destroy(ctx)
+
 		switch {
 		case errors.Is(err, rbderrors.ErrImageNotFound):
-			err = fmt.Errorf("volume %s not found: %w", id, err)
-
-			return nil, err
+			return nil, fmt.Errorf("volume %s not found: %w", id, err)
 		case errors.Is(err, util.ErrPoolNotFound):
-			err = fmt.Errorf("pool %s not found for %s: %w", volume.Pool, id, err)
-
-			return nil, err
+			return nil, fmt.Errorf("pool not found for %s: %w", id, err)
 		default:
 			return nil, fmt.Errorf("failed to get volume from id %q: %w", id, err)
 		}
@@ -102,17 +100,15 @@ func (mgr *rbdManager) GetSnapshotByID(ctx context.Context, id string) (types.Sn
 
 	snapshot, err := genSnapFromSnapID(ctx, id, creds, mgr.secrets)
 	if err != nil {
+		snapshot.Destroy(ctx)
+
 		switch {
 		case errors.Is(err, rbderrors.ErrImageNotFound):
-			err = fmt.Errorf("volume %s not found: %w", id, err)
-
-			return nil, err
+			return nil, fmt.Errorf("snapshot %s not found: %w", id, err)
 		case errors.Is(err, util.ErrPoolNotFound):
-			err = fmt.Errorf("pool %s not found for %s: %w", snapshot.Pool, id, err)
-
-			return nil, err
+			return nil, fmt.Errorf("pool not found for %s: %w", id, err)
 		default:
-			return nil, fmt.Errorf("failed to get volume from id %q: %w", id, err)
+			return nil, fmt.Errorf("failed to get snapshot from id %q: %w", id, err)
 		}
 	}
 

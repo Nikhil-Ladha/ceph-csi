@@ -165,6 +165,9 @@ type rbdImage struct {
 
 	// ParentInTrash indicates the parent image is in trash.
 	ParentInTrash bool
+	// ParentImageID is the image ID of the parent image, populated by
+	// getImageInfo(). Valid even when the parent is in trash.
+	ParentImageID string
 
 	// RBD QoS configuration
 	QosParameters map[string]string
@@ -420,6 +423,9 @@ func (ri *rbdImage) Connect(cr *util.Credentials) error {
 // Destroy cleans up the rbdVolume and closes the connection to the Ceph
 // cluster in case one was setup.
 func (ri *rbdImage) Destroy(ctx context.Context) {
+	if ri == nil {
+		return
+	}
 	if ri.ioctx != nil {
 		ri.ioctx.Destroy()
 		ri.ioctx = nil
@@ -526,7 +532,7 @@ func (ri *rbdImage) getImageID() error {
 	if ri.ImageID != "" {
 		return nil
 	}
-	image, err := ri.open()
+	image, err := ri.openReadOnly()
 	if err != nil {
 		return err
 	}
@@ -632,7 +638,7 @@ func (ri *rbdImage) openReadOnly() (*librbd.Image, error) {
 // isInUse is called with exponential backoff to check the image is used by
 // anyone else the returned bool value is discarded if its a RWX access.
 func (ri *rbdImage) isInUse() (bool, error) {
-	image, err := ri.open()
+	image, err := ri.openReadOnly()
 	if err != nil {
 		if errors.Is(err, rbderrors.ErrImageNotFound) || errors.Is(err, util.ErrPoolNotFound) {
 			return false, err
@@ -658,8 +664,8 @@ func (ri *rbdImage) isInUse() (bool, error) {
 		return false, fmt.Errorf("cannot map image %s it is not primary", ri)
 	}
 
-	// because we opened the image, there is at least one watcher
-	defaultWatchers := 1
+	// openReadOnly does not register a watcher on the image
+	defaultWatchers := 0
 	if mirrorInfo.Primary {
 		count, err := util.GetRBDMirrorDaemonCount(util.CsiConfigFile, ri.ClusterID)
 		if err != nil {
@@ -715,31 +721,6 @@ func isCephMgrSupported(ctx context.Context, clusterID string, err error) (bool,
 	}
 
 	return true, nil
-}
-
-// ensureImageCleanup finds image in trash and if found removes it
-// from trash.
-func (ri *rbdImage) ensureImageCleanup(ctx context.Context) error {
-	err := ri.openIoctx()
-	if err != nil {
-		return err
-	}
-
-	trashInfoList, err := librbd.GetTrashList(ri.ioctx)
-	if err != nil {
-		log.ErrorLog(ctx, "failed to list images in trash: %v", err)
-
-		return err
-	}
-	for _, val := range trashInfoList {
-		if val.Name == ri.RbdImageName {
-			ri.ImageID = val.Id
-
-			return ri.trashRemoveImage(ctx)
-		}
-	}
-
-	return nil
 }
 
 // Delete deletes a ceph image with provision and volume options.
@@ -800,6 +781,11 @@ func (ri *rbdImage) trashRemoveImage(ctx context.Context) error {
 	}
 
 	_, err = ta.AddTrashRemove(admin.NewImageSpec(ri.Pool, ri.RadosNamespace, ri.ImageID))
+	if err != nil && errors.Is(err, rados.ErrNotFound) {
+		log.DebugLog(ctx, "image %s (ID %s) not found in trash, already removed", ri, ri.ImageID)
+
+		return nil
+	}
 
 	rbdCephMgrSupported, knownErr := isCephMgrSupported(ctx, ri.ClusterID, err)
 	if rbdCephMgrSupported && err != nil {
@@ -811,6 +797,12 @@ func (ri *rbdImage) trashRemoveImage(ctx context.Context) error {
 	if !rbdCephMgrSupported && knownErr != nil {
 		trashRemoveError := librbd.TrashRemove(ri.ioctx, ri.ImageID, true)
 		if trashRemoveError != nil {
+			if errors.Is(trashRemoveError, librbd.ErrNotFound) {
+				log.DebugLog(ctx, "image %s not found in trash, already removed", ri)
+
+				return nil
+			}
+
 			log.ErrorLog(ctx, "failed to delete rbd image: %s, %v", ri, trashRemoveError)
 
 			return fmt.Errorf(
@@ -826,8 +818,34 @@ func (ri *rbdImage) trashRemoveImage(ctx context.Context) error {
 	return nil
 }
 
-// DeleteTempImage deletes the temporary image created for volume datasource.
-func (rv *rbdVolume) DeleteTempImage(ctx context.Context) error {
+// removeImageFromTrash removes an image from trash by its known image ID.
+func (ri *rbdImage) removeImageFromTrash(ctx context.Context) error {
+	if ri.ImageID == "" {
+		return fmt.Errorf("image ID is empty, cannot remove %s from trash", ri)
+	}
+
+	if err := ri.openIoctx(); err != nil {
+		return err
+	}
+
+	return ri.trashRemoveImage(ctx)
+}
+
+// Delete deletes the rbd volume. If the volume is a clone (its parent name
+// ends with the temp image suffix), the temporary clone image is cleaned up
+// first so that the parent image info is still accessible for trash lookup.
+func (rv *rbdVolume) Delete(ctx context.Context) error {
+	if rv.isClone() {
+		if err := rv.deleteTempImage(ctx); err != nil {
+			return fmt.Errorf("failed to delete temporary rbd image: %w", err)
+		}
+	}
+
+	return rv.rbdImage.Delete(ctx)
+}
+
+// deleteTempImage deletes the temporary image created for volume datasource.
+func (rv *rbdVolume) deleteTempImage(ctx context.Context) error {
 	tempClone := rv.generateTempClone()
 	snap := &rbdSnapshot{}
 	defer snap.Destroy(ctx)
@@ -846,11 +864,20 @@ func (rv *rbdVolume) DeleteTempImage(ctx context.Context) error {
 	err = tempClone.Delete(ctx)
 	if err != nil {
 		if errors.Is(err, rbderrors.ErrImageNotFound) {
-			return tempClone.ensureImageCleanup(ctx)
-		} else {
-			// return error if it is not ErrImageNotFound
-			return err
+			if rv.ParentInTrash &&
+				rv.ParentName == tempClone.RbdImageName &&
+				rv.ParentImageID != "" {
+				tempClone.ImageID = rv.ParentImageID
+
+				return tempClone.removeImageFromTrash(ctx)
+			}
+
+			log.DebugLog(ctx, "temp clone %s not found and not in trash, already removed", tempClone)
+
+			return nil
 		}
+
+		return err
 	}
 
 	return nil
@@ -1600,6 +1627,12 @@ func (ri *rbdImage) hasSnapshotFeature() bool {
 	return (uint64(ri.ImageFeatureSet) & librbd.FeatureLayering) == librbd.FeatureLayering
 }
 
+// isClone returns true when the volume's parent image is the temporary clone
+// image that was created as datasource for this volume.
+func (rv *rbdVolume) isClone() bool {
+	return rv.ParentName == rv.generateTempCloneName()
+}
+
 func (ri *rbdImage) createSnapshot(ctx context.Context, pOpts *rbdSnapshot) error {
 	pOpts.RbdImageName = ri.RbdImageName
 	log.DebugLog(ctx, "rbd: snap create %s using mon %s", pOpts, pOpts.Monitors)
@@ -1785,7 +1818,7 @@ func (ri *rbdImage) GetCreationTime(ctx context.Context) (*time.Time, error) {
 // getImageInfo queries rbd about the given image and returns its metadata, and returns
 // ErrImageNotFound if provided image is not found.
 func (ri *rbdImage) getImageInfo() error {
-	image, err := ri.open()
+	image, err := ri.openReadOnly()
 	if err != nil {
 		return err
 	}
@@ -1811,6 +1844,9 @@ func (ri *rbdImage) getImageInfo() error {
 		// the parent is an error or not.
 		if errors.Is(err, librbd.ErrNotFound) {
 			ri.ParentName = ""
+			ri.ParentPool = ""
+			ri.ParentInTrash = false
+			ri.ParentImageID = ""
 		} else {
 			return err
 		}
@@ -1818,6 +1854,7 @@ func (ri *rbdImage) getImageInfo() error {
 		ri.ParentName = parentInfo.Image.ImageName
 		ri.ParentPool = parentInfo.Image.PoolName
 		ri.ParentInTrash = parentInfo.Image.Trash
+		ri.ParentImageID = parentInfo.Image.ImageID
 	}
 	// Get image creation time
 	tm, err := image.GetCreateTimestamp()
@@ -2028,6 +2065,63 @@ func cleanupRBDImageMetadataStash(metaDataPath string) error {
 	return nil
 }
 
+// The "/csi" directory inside the container is backed by the
+// host-path volume "socket-dir" (ref rbd-plugin DaemonSet yaml file)
+// which maps to "/var/lib/kubelet/plugins/rbd.csi.ceph.com" on the node.
+var volumeInfoDir = "/csi/volume-info"
+
+// Holds per-volume metadata that needs to persist across
+// node-plugin restarts, indexed by volumeID.
+type volumeInfo struct {
+	IsBlockMode bool `json:"isBlockMode"`
+}
+
+// This function is different from "stashRBDImageMetadata" which stores info at stagingPath.
+// Not all RPCs have access to the stagingPath. For example,
+// NodeGetVolumeStats uses this to determine the volume mode using volumeID as the index.
+func stashVolumeInfo(volumeID string, info *volumeInfo) error {
+	if err := os.MkdirAll(volumeInfoDir, 0o750); err != nil {
+		return fmt.Errorf("failed to create volume-info directory: %w", err)
+	}
+
+	encodedBytes, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("failed to marshal volume info for %s: %w", volumeID, err)
+	}
+
+	fPath := filepath.Join(volumeInfoDir, volumeID+".json")
+	if err = os.WriteFile(fPath, encodedBytes, 0o600); err != nil {
+		return fmt.Errorf("failed to stash volume info for %s: %w", volumeID, err)
+	}
+
+	return nil
+}
+
+func lookupVolumeInfo(volumeID string) (*volumeInfo, error) {
+	fPath := filepath.Join(volumeInfoDir, volumeID+".json")
+
+	encodedBytes, err := os.ReadFile(fPath) // #nosec - intended reading from fPath
+	if err != nil {
+		return nil, err
+	}
+
+	var info volumeInfo
+	if err = json.Unmarshal(encodedBytes, &info); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal volume info for %s: %w", volumeID, err)
+	}
+
+	return &info, nil
+}
+
+func removeVolumeInfo(volumeID string) error {
+	fPath := filepath.Join(volumeInfoDir, volumeID+".json")
+	if err := os.Remove(fPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove volume info for %s: %w", volumeID, err)
+	}
+
+	return nil
+}
+
 // expand checks if the requestedVolume size and the existing image size both
 // are same. If they are same, it returns nil else it resizes the image.
 func (rv *rbdVolume) expand() error {
@@ -2058,7 +2152,7 @@ func (ri *rbdImage) resize(newSize int64) error {
 }
 
 func (ri *rbdImage) GetMetadata(key string) (string, error) {
-	image, err := ri.open()
+	image, err := ri.openReadOnly()
 	if err != nil {
 		return "", err
 	}
@@ -2511,11 +2605,12 @@ func (rv *rbdVolume) modifyVolumeAttributes(
 	}
 
 	// Find and apply the QoS type present in the request.
+	// Unrecognized keys are already rejected by validateQoSParameters.
 	for _, handler := range handlers {
 		if handler.HasParams(newMutableParameters) {
 			// Validate parameters before applying.
 			if err := handler.Validate(newMutableParameters); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", rbderrors.ErrInvalidArgument, err)
 			}
 
 			// Apply the QoS settings.

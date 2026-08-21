@@ -256,6 +256,14 @@ func getReqID(req any) string {
 		*replication.ResyncVolumeRequest,
 		*replication.GetVolumeReplicationInfoRequest:
 		reqID = GetIDFromReplication(r)
+	case *replication.ReplicationSource_Volume:
+		if r.Volume != nil {
+			reqID = r.Volume.GetVolumeId()
+		}
+	case *replication.ReplicationSource_Volumegroup:
+		if r.Volumegroup != nil {
+			reqID = r.Volumegroup.GetVolumeGroupId()
+		}
 
 	// VolumeGroup
 	case *volumegroup.CreateVolumeGroupRequest:
@@ -387,6 +395,8 @@ func logSlowGRPC(
 		ticker := time.NewTicker(logInterval)
 		defer ticker.Stop()
 
+		logStacks := true // only log goroutine stacks once
+
 		for {
 			select {
 			case t := <-ticker.C:
@@ -395,6 +405,10 @@ func logSlowGRPC(
 					"Slow GRPC call %s (%s)", info.FullMethod, timePassed)
 				log.TraceLog(ctx,
 					"Slow GRPC request: %s", protosanitizer.StripSecrets(req))
+				if logStacks {
+					log.TraceStacks(ctx)
+					logStacks = false
+				}
 			case <-handlerFinished:
 				return
 			}

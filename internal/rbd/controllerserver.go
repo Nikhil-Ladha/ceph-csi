@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 
 	osdAdmin "github.com/ceph/go-ceph/common/admin/osd"
@@ -160,27 +161,65 @@ func validateQoSParameters(mutableParams map[string]string, mounter string) erro
 		// NBD mounter: only NBD QoS params are valid.
 		// The shared keys (maxReadIops, etc.) serve as NBD max limits here.
 		if HasQoSParams(mutableParams) {
+			if unknown := unrecognizedKeys(mutableParams, nbdQoSKnownKeys); len(unknown) > 0 {
+				return fmt.Errorf("mutable parameters %v are not recognized QoS parameters for %q mounter",
+					unknown, mounter)
+			}
+
 			return validateNBDQoSParams(mutableParams)
 		}
 
-		return nil
+		keys := slices.Sorted(maps.Keys(mutableParams))
+
+		return fmt.Errorf("mutable parameters %v for %q mounter are missing required base QoS parameters",
+			keys, mounter)
 	}
 
 	// krbd mounter: only cgroup v2 QoS params are supported.
 	// Reject any NBD-specific params that won't be applied via cgroup.
 	if HasQoSParams(mutableParams) {
-		return fmt.Errorf(
-			"NBD QoS parameters (baseIops, baseReadIops, etc.) are not supported with %q mounter, "+
-				"use cgroup QoS parameters (maxReadIops, maxWriteIops, maxReadBps, maxWriteBps)", mounter)
+		keys := slices.Sorted(maps.Keys(mutableParams))
+
+		return fmt.Errorf("mutable parameters %v contain NBD-specific QoS parameters not supported with %q mounter",
+			keys, mounter)
 	}
 
 	if hasCgroupQoSParams(mutableParams) {
+		if unknown := unrecognizedKeys(mutableParams, cgroupQoSKnownKeys()); len(unknown) > 0 {
+			return fmt.Errorf("mutable parameters %v are not recognized QoS parameters for %q mounter",
+				unknown, mounter)
+		}
+
 		if err := validateCgroupQoSParams(mutableParams); err != nil {
 			return fmt.Errorf("invalid cgroup QoS parameters: %w", err)
 		}
+
+		return nil
 	}
 
-	return nil
+	keys := slices.Sorted(maps.Keys(mutableParams))
+
+	return fmt.Errorf("mutable parameters %v for %q mounter are missing required cgroup QoS parameters",
+		keys, mounter)
+}
+
+// unrecognizedKeys returns parameter keys not present in the known set.
+func unrecognizedKeys(params map[string]string, known []string) []string {
+	knownSet := make(map[string]struct{}, len(known))
+	for _, k := range known {
+		knownSet[k] = struct{}{}
+	}
+
+	var unknown []string
+	for k := range params {
+		if _, ok := knownSet[k]; !ok {
+			unknown = append(unknown, k)
+		}
+	}
+
+	slices.Sort(unknown)
+
+	return unknown
 }
 
 // parseVolCreateRequest take create volume `request` argument and make use of the
@@ -887,6 +926,7 @@ func checkContentSource(
 		}
 		rbdSnap, err := genSnapFromSnapID(ctx, snapshotID, cr, req.GetSecrets())
 		if err != nil {
+			rbdSnap.Destroy(ctx)
 			log.ErrorLog(ctx, "failed to get backend snapshot for %s: %v", snapshotID, err)
 			if !errors.Is(err, rbderrors.ErrSnapNotFound) {
 				return nil, nil, status.Error(codes.Internal, err.Error())
@@ -907,6 +947,7 @@ func checkContentSource(
 		}
 		rbdvol, err := GenVolFromVolID(ctx, volID, cr, req.GetSecrets())
 		if err != nil {
+			rbdvol.Destroy(ctx)
 			log.ErrorLog(ctx, "failed to get backend image for %s: %v", volID, err)
 			if !errors.Is(err, rbderrors.ErrImageNotFound) {
 				return nil, nil, status.Error(codes.Internal, err.Error())
@@ -949,8 +990,7 @@ func (cs *ControllerServer) checkErrAndUndoReserve(
 	}
 
 	if errors.Is(err, rbderrors.ErrImageNotFound) {
-		notFoundErr := rbdVol.ensureImageCleanup(ctx)
-		if notFoundErr != nil {
+		if notFoundErr := rbdVol.removeImageFromTrash(ctx); notFoundErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to cleanup image %q: %v", rbdVol, notFoundErr)
 		}
 	} else {
@@ -1137,15 +1177,6 @@ func cleanupRBDImage(ctx context.Context, rbdVol *rbdVolume,
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Aborted, err.Error())
-	}
-
-	// delete the temporary rbd image created as part of volume clone during
-	// create volume
-	err = rbdVol.DeleteTempImage(ctx)
-	if err != nil {
-		log.ErrorLog(ctx, "failed to delete temporary rbd image: %v", err)
-
-		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	// Deleting rbd image
@@ -1550,6 +1581,8 @@ func (cs *ControllerServer) DeleteSnapshot(
 
 	rbdSnap, err := genSnapFromSnapID(ctx, snapshotID, cr, req.GetSecrets())
 	if err != nil {
+		rbdSnap.Destroy(ctx)
+
 		// if error is ErrPoolNotFound, the pool is already deleted we don't
 		// need to worry about deleting snapshot or omap data, return success
 		if errors.Is(err, util.ErrPoolNotFound) {
@@ -1617,9 +1650,9 @@ func cleanUpImageAndSnapReservation(ctx context.Context, rbdSnap *rbdSnapshot, c
 	defer rbdVol.Destroy(ctx)
 
 	// cleanup the image from trash if the error is image not found.
-	err = rbdVol.ensureImageCleanup(ctx)
+	err = rbdVol.removeImageFromTrash(ctx)
 	if err != nil {
-		log.ErrorLog(ctx, "failed to delete rbd image: %q with error: %v", rbdVol.Pool, rbdVol.VolName, err)
+		log.ErrorLog(ctx, "failed to delete rbd image %q: %v", rbdVol, err)
 
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -1767,21 +1800,12 @@ func (cs *ControllerServer) getServiceAccountRestriction(
 	req *csi.ControllerPublishVolumeRequest,
 ) (string, error) {
 	volumeID := req.GetVolumeId()
-	secrets := req.GetSecrets()
-
-	if secrets == nil {
-		secretName, secretNamespace, err := util.GetControllerPublishSecretRef(volumeID, util.RBDType)
-		if err != nil {
-			log.WarningLog(ctx, "controller publish secret not found: %v", err)
-
-			return "", nil
-		}
-
-		secrets, err = k8s.GetSecret(secretName, secretNamespace)
-		if err != nil {
-			return "", status.Errorf(codes.Internal,
-				"failed to get controller publish secret from k8s: %v", err)
-		}
+	secrets, skip, err := util.GetControllerPublishSecrets(ctx, req.GetSecrets(), volumeID, util.RBDType)
+	if skip {
+		return "", nil
+	}
+	if err != nil {
+		return "", status.Error(codes.Internal, err.Error())
 	}
 
 	cr, err := util.NewUserCredentials(secrets)
@@ -1839,21 +1863,12 @@ func (cs *ControllerServer) ControllerUnpublishVolume(
 	}
 	defer cs.VolumeLocks.Release(volumeId)
 
-	secrets := req.GetSecrets()
-	if secrets == nil {
-		secretName, secretNamespace, err := util.GetControllerPublishSecretRef(volumeId, util.RBDType)
-		if err != nil {
-			log.WarningLog(ctx, "controller publish secret not found: %v", err)
-
-			// If the secret is not found, return success to not break for older PVs
-			// without controller-publish secrets.
-			return &csi.ControllerUnpublishVolumeResponse{}, nil
-		}
-
-		secrets, err = k8s.GetSecret(secretName, secretNamespace)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get controller publish secret from k8s: %w", err)
-		}
+	secrets, skip, err := util.GetControllerPublishSecrets(ctx, req.GetSecrets(), volumeId, util.RBDType)
+	if skip {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	credentials, err := util.NewAdminCredentials(secrets)
@@ -1864,6 +1879,8 @@ func (cs *ControllerServer) ControllerUnpublishVolume(
 
 	rv, err := GenVolFromVolID(ctx, volumeId, credentials, secrets)
 	if err != nil {
+		rv.Destroy(ctx)
+
 		return nil, status.Errorf(codes.Internal, "failed to generate volume from volume ID %s: %v",
 			volumeId, err)
 	}
@@ -2088,8 +2105,10 @@ func (cs *ControllerServer) ControllerModifyVolume(
 		return nil, status.Errorf(codes.Internal, "failed to determine volume mounter type: %v", err)
 	}
 
-	if err = validateQoSParameters(mutableParameters, rbdVol.Mounter); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	if len(mutableParameters) > 0 {
+		if err = validateQoSParameters(mutableParameters, rbdVol.Mounter); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 	}
 
 	// set RequestedVolSize, because calcQosBasedOnCapacity use it.
@@ -2098,6 +2117,10 @@ func (cs *ControllerServer) ControllerModifyVolume(
 	err = rbdVol.modifyVolumeAttributes(ctx, mutableParameters)
 	if err != nil {
 		log.ErrorLog(ctx, "failed to modify volume: %s with error: %v", rbdVol, err)
+
+		if errors.Is(err, rbderrors.ErrInvalidArgument) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}

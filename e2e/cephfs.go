@@ -241,7 +241,14 @@ var _ = Describe(cephfsType, func() {
 		if err != nil {
 			logAndFail("failed to create node secret: %v", err)
 		}
-		deployVault(f.ClientSet, deployTimeout)
+		if !skipVault {
+			deployVault(f.ClientSet, deployTimeout)
+		} else {
+			err = createEmptyKMSConfigMap(f.ClientSet, cephCSINamespace)
+			if err != nil {
+				logAndFail("failed to create empty KMS configmap: %v", err)
+			}
+		}
 
 		err = cephFSDeployment.setClusterName(defaultClusterName)
 		if err != nil {
@@ -300,7 +307,9 @@ var _ = Describe(cephfsType, func() {
 		if err != nil {
 			logAndFail("failed to delete storageclass: %v", err)
 		}
-		deleteVault()
+		if !skipVault {
+			deleteVault()
+		}
 
 		err = deleteSubvolumegroup(f, fileSystemName, subvolumegroup)
 		if err != nil {
@@ -336,7 +345,7 @@ var _ = Describe(cephfsType, func() {
 		appEphemeralPath := cephFSExamplePath + "pod-ephemeral.yaml"
 		pvcRWOPPath := cephFSExamplePath + "pvc-rwop.yaml"
 
-		It("checking provisioner and nodeplugin are running", func() {
+		It("checking provisioner and nodeplugin are running", Label("acceptance"), func() {
 			Expect(waitForCSI(
 				f.ClientSet,
 				cephFSDeployment.getDeploymentName(),
@@ -940,7 +949,7 @@ var _ = Describe(cephfsType, func() {
 			}
 		})
 
-		It("create a PVC and bind it to an app", func() {
+		It("create a PVC and bind it to an app", Label("acceptance"), func() {
 			err := createCephfsStorageClass(f.ClientSet, f, false, nil)
 			if err != nil {
 				logAndFail("failed to create CephFS storageclass: %v", err)
@@ -1502,7 +1511,7 @@ var _ = Describe(cephfsType, func() {
 			}
 		})
 
-		It("create a PVC clone and bind it to an app", func() {
+		It("create a PVC clone and bind it to an app", Label("acceptance"), func() {
 			var wg sync.WaitGroup
 			totalCount := 3
 			wgErrs := make([]error, totalCount)
@@ -2401,7 +2410,7 @@ var _ = Describe(cephfsType, func() {
 			}
 		}
 
-		It("create a PVC-PVC clone and bind it to an app", func() {
+		It("create a PVC-PVC clone and bind it to an app", Label("acceptance"), func() {
 			var wg sync.WaitGroup
 			totalCount := 3
 			wgErrs := make([]error, totalCount)
@@ -2738,6 +2747,99 @@ var _ = Describe(cephfsType, func() {
 			// validate OMAP count
 			validateOmapCount(f, 0, cephfsType, metadataPool, volumesType)
 			validateOmapCount(f, 0, cephfsType, metadataPool, snapsType)
+		})
+
+		It("create a PVC with a VolumeAttributesClass for MDS pinning and modify it", func() {
+			// VolumeAttributesClass support requires Kubernetes 1.34+.
+			if !k8sVersionGreaterEquals(f.ClientSet, 1, 34) {
+				framework.Logf("skipping VolumeAttributesClass test, needs Kubernetes >= 1.34")
+
+				return
+			}
+
+			// This test validates VolumeAttributesClass (VAC) support for
+			// CephFS subvolumes via MDS pinning, exercising both the
+			// CreateVolume and ControllerModifyVolume code paths:
+			//   1. Create a StorageClass.
+			//   2. Create two VACs with different mds-pin-export ranks.
+			//   3. Create a PVC referencing the first VAC and verify the PV
+			//      gets the VAC applied at creation time.
+			//   4. Update the PVC to reference the second VAC and verify the
+			//      change is applied via ControllerModifyVolume.
+			//   5. Clean up.
+			err := createCephfsStorageClass(f.ClientSet, f, true, nil)
+			if err != nil {
+				logAndFail("failed to create CephFS storageclass: %v", err)
+			}
+			defer func() {
+				err = deleteResource(cephFSExamplePath + "storageclass.yaml")
+				if err != nil {
+					logAndFail("failed to delete CephFS storageclass: %v", err)
+				}
+			}()
+
+			vacName1 := "e2e-" + f.UniqueName + "-cephfs-vac1"
+			vacName2 := "e2e-" + f.UniqueName + "-cephfs-vac2"
+
+			err = createCephFSVolumeAttributesClass(f.ClientSet, vacName1,
+				map[string]string{"mds-pin-export": "0"})
+			if err != nil {
+				logAndFail("failed to create VolumeAttributesClass: %v", err)
+			}
+			defer func() {
+				if err = deleteCephFSVolumeAttributesClass(f.ClientSet, vacName1); err != nil {
+					logAndFail("failed to delete VolumeAttributesClass: %v", err)
+				}
+			}()
+
+			err = createCephFSVolumeAttributesClass(f.ClientSet, vacName2,
+				map[string]string{"mds-pin-export": "1"})
+			if err != nil {
+				logAndFail("failed to create VolumeAttributesClass: %v", err)
+			}
+			defer func() {
+				if err = deleteCephFSVolumeAttributesClass(f.ClientSet, vacName2); err != nil {
+					logAndFail("failed to delete VolumeAttributesClass: %v", err)
+				}
+			}()
+
+			// create a PVC referencing the first VAC; this exercises the
+			// CreateVolume path applying the mutable parameters.
+			pvc, err := loadPVC(pvcPath)
+			if err != nil {
+				logAndFail("failed to load PVC: %v", err)
+			}
+			pvc.Namespace = f.UniqueName
+			pvc.Spec.VolumeAttributesClassName = &vacName1
+
+			err = createPVCAndvalidatePV(f.ClientSet, pvc, deployTimeout)
+			if err != nil {
+				logAndFail("failed to create PVC: %v", err)
+			}
+
+			pv, err := getBoundPV(f.ClientSet, pvc)
+			if err != nil {
+				logAndFail("failed to get bound PV: %v", err)
+			}
+			if pv.Spec.VolumeAttributesClassName == nil ||
+				*pv.Spec.VolumeAttributesClassName != vacName1 {
+				logAndFail("PV %s does not reference the expected VolumeAttributesClass %q",
+					pv.Name, vacName1)
+			}
+			validateSubvolumeCount(f, 1, fileSystemName, subvolumegroup)
+
+			// update the PVC to reference the second VAC; this exercises the
+			// ControllerModifyVolume path.
+			err = modifyPVCVolumeAttributesClass(f.ClientSet, pvc, vacName2)
+			if err != nil {
+				logAndFail("failed to modify VolumeAttributesClass: %v", err)
+			}
+
+			err = deletePVCAndValidatePV(f.ClientSet, pvc, deployTimeout)
+			if err != nil {
+				logAndFail("failed to delete PVC: %v", err)
+			}
+			validateSubvolumeCount(f, 0, fileSystemName, subvolumegroup)
 		})
 
 		// Make sure this should be last testcase in

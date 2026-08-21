@@ -43,13 +43,13 @@ RUN source /build.env \
 	make \
 	gcc \
 	librados-devel \
-        libcephfs-devel \
+	libcephfs-devel \
 	librbd-devel \
 	python3-pip \
     && dnf -y --nobest update \
     && pip install mkdocs-material==${MKDOCS_MATERIAL} \
     && dnf clean all \
-    && rm -rf /var/cache/yum \
+    && rm -rf /var/cache/dnf /var/cache/yum \
     && true
 
 WORKDIR "/go/src/github.com/ceph/ceph-csi"
