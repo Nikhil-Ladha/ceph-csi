@@ -13,7 +13,7 @@ require (
 	github.com/ceph/ceph-csi/api v0.0.0-00010101000000-000000000000
 	github.com/google/uuid v1.6.0
 	github.com/kubernetes-csi/external-snapshotter/client/v8 v8.6.0
-	github.com/onsi/ginkgo/v2 v2.33.0
+	github.com/onsi/ginkgo/v2 v2.33.1
 	github.com/onsi/gomega v1.44.0
 	// when updating k8s.io modules, update the 'replace' section below too
 	k8s.io/api v0.37.0
@@ -41,7 +41,7 @@ exclude k8s.io/client-go v12.0.0+incompatible
 require (
 	github.com/kubernetes-csi/external-snapshot-metadata v1.1.0
 	go.yaml.in/yaml/v2 v2.4.4
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	google.golang.org/grpc v1.84.0
 )
 
