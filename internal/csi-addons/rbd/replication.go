@@ -66,6 +66,8 @@ const (
 	imageMirroringKey = "mirroringMode"
 	// forceKey + key to get the force option from parameters.
 	forceKey = "force"
+	// retryKey is the key to get the retry option from parameters.
+	retryKey = "retry"
 
 	// schedulingIntervalKey to get the schedulingInterval from the
 	// parameters.
@@ -128,6 +130,23 @@ func getForceOption(ctx context.Context, parameters map[string]string) (bool, er
 	}
 
 	return force, nil
+}
+
+// getRetryOption extracts the retry option from the GRPC request parameters.
+// If not set, the default will be set to false.
+func getRetryOption(ctx context.Context, parameters map[string]string) (bool, error) {
+	val, ok := parameters[retryKey]
+	if !ok {
+		log.WarningLog(ctx, "%s is not set in parameters, setting to default (%v)", retryKey, false)
+
+		return false, nil
+	}
+	retry, err := strconv.ParseBool(val)
+	if err != nil {
+		return false, status.Error(codes.Internal, err.Error())
+	}
+
+	return retry, nil
 }
 
 // getFlattenMode gets flatten mode from the input GRPC request parameters.
@@ -369,6 +388,12 @@ func (rs *ReplicationServer) DisableVolumeReplication(ctx context.Context,
 		return nil, err
 	}
 
+	// extract the retry option
+	retry, err := getRetryOption(ctx, req.GetParameters())
+	if err != nil {
+		return nil, err
+	}
+
 	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
@@ -381,10 +406,25 @@ func (rs *ReplicationServer) DisableVolumeReplication(ctx context.Context,
 	case librbd.MirrorImageDisabled.String():
 	// image mirroring is still disabling
 	case librbd.MirrorImageDisabling.String():
+		if retry {
+			err = corerbd.DisableVolumeReplication(mirror, ctx, info.IsPrimary(), force)
+			if err != nil {
+				if strings.Contains(err.Error(), "Device or resource busy") {
+					return nil, status.Error(codes.FailedPrecondition, err.Error())
+				}
+				return nil, getGRPCError(err)
+			}
+
+			return &replication.DisableVolumeReplicationResponse{}, nil
+		}
+
 		return nil, status.Errorf(codes.Aborted, "%s is in disabling state", volumeID)
 	case librbd.MirrorImageEnabled.String():
 		err = corerbd.DisableVolumeReplication(mirror, ctx, info.IsPrimary(), force)
 		if err != nil {
+			if strings.Contains(err.Error(), "Device or resource busy") {
+				return nil, status.Error(codes.FailedPrecondition, err.Error())
+			}
 			return nil, getGRPCError(err)
 		}
 
